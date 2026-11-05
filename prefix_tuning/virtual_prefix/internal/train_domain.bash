@@ -13,7 +13,9 @@ export NO_PROXY="$(hostname -I | tr ' ' ','),$NO_PROXY"
 export no_proxy="$NO_PROXY"
 # TileLang links system libz3, which needs a newer C++ ABI than Conda provides.
 # Scope the compatible system runtime to this launcher and its Ray children.
-export LD_PRELOAD="/usr/local/miniconda3/lib/libstdc++.so.6${LD_PRELOAD:+:$LD_PRELOAD}"
+if [[ -f /usr/local/miniconda3/lib/libstdc++.so.6 ]]; then
+    export LD_PRELOAD="/usr/local/miniconda3/lib/libstdc++.so.6${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
 
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python)}
 cd "$REPO_ROOT"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import torch
 
 from .cuda_runtime_compat import prefer_real_cudart_over_stubs
@@ -169,6 +171,14 @@ class Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
         # This short prefix-state calculation is outside the hot decode path.
         # The vLLM-Ascend Triton kernel can fault on 910C for this TND shape;
         # use its reference implementation for the 64 virtual prefix tokens.
+        # vLLM caches the recurrent state as [N, H, V, K]; FLA defaults to
+        # [N, H, K, V]. Head K and V dims are equal here, so a mismatch is not a
+        # shape error but a silent transpose that only shows for nonzero prefixes.
+        layout = {}
+        if not _is_npu_backend() and "state_v_first" in inspect.signature(
+            chunk_gated_delta_rule_pytorch
+        ).parameters:
+            layout["state_v_first"] = True
         _, final_recurrent_state = chunk_gated_delta_rule_pytorch(
             q=query,
             k=key,
@@ -179,6 +189,7 @@ class Qwen3_5IndependentDeltaKVPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
             output_final_state=True,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=True,
+            **layout,
         )
 
         history_length = self.conv_kernel_size - 1

@@ -59,6 +59,37 @@ class Qwen3_5ResidualSoftPrefixAttention(Qwen3NextAttention):
         self._cached_prefix_value = None
         self._cached_prefix_projection_key = None
 
+    @torch.no_grad()
+    def refresh_residual_attention_prefix_cache(self) -> None:
+        """Project the prefix tables once, outside of forward.
+
+        Forward then only reads these buffers, so it never mutates module state
+        and can run under torch.compile / CUDA graphs.  Existing buffers are
+        updated in place so captured graphs see refreshed values after a
+        weight sync.
+        """
+        dtype = self.qkv_proj.weight.dtype
+        prefix_key, prefix_value = self._compute_prefix_key_value(dtype)
+        same_layout = (
+            self._cached_prefix_key is not None
+            and self._cached_prefix_key.shape == prefix_key.shape
+            and self._cached_prefix_key.dtype == prefix_key.dtype
+            and self._cached_prefix_key.device == prefix_key.device
+        )
+        if same_layout:
+            self._cached_prefix_key.copy_(prefix_key)
+            self._cached_prefix_value.copy_(prefix_value)
+        else:
+            self._cached_prefix_key = prefix_key.detach().contiguous()
+            self._cached_prefix_value = prefix_value.detach().contiguous()
+        self._cached_prefix_projection_key = (
+            self.prefix_key_tokens._version,
+            self.prefix_value_tokens._version,
+            self.prefix_key_tokens.device,
+            dtype,
+        )
+        self._prefix_projection_cache_misses += 1
+
     def _split_qkv(self, qkv: torch.Tensor):
         if self.attn_output_gate:
             return qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
@@ -124,6 +155,10 @@ class Qwen3_5ResidualSoftPrefixAttention(Qwen3NextAttention):
     def _get_prefix_key_value(
         self, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Fast path: buffers filled by refresh_residual_attention_prefix_cache()
+        # at weight-load time; read-only, so compile/CUDA-graph safe.
+        if self._cached_prefix_key is not None and self._cached_prefix_key.dtype == dtype:
+            return self._cached_prefix_key, self._cached_prefix_value
         cache_key = (
             self.prefix_key_tokens._version,
             self.prefix_value_tokens._version,
@@ -207,6 +242,11 @@ class Qwen3_5HybridDeltaResidualAttentionPrefixForConditionalGeneration(
             if isinstance(module, Qwen3_5ResidualSoftPrefixAttention):
                 module.invalidate_residual_attention_prefix_cache()
 
+    def refresh_residual_attention_prefix_caches(self) -> None:
+        for module in self.modules():
+            if isinstance(module, Qwen3_5ResidualSoftPrefixAttention):
+                module.refresh_residual_attention_prefix_cache()
+
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
         expected = {
@@ -220,7 +260,7 @@ class Qwen3_5HybridDeltaResidualAttentionPrefixForConditionalGeneration(
                 "vLLM did not load all residual attention prefix tensors: "
                 + ", ".join(sorted(missing))
             )
-        self.invalidate_residual_attention_prefix_caches()
+        self.refresh_residual_attention_prefix_caches()
         return loaded
 
 

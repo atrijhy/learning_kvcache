@@ -6,8 +6,8 @@ set -euo pipefail
 
 # Copy of prefix_tuning/virtual_prefix/internal/train_domain.bash (EFS is read-only) generalised to the all-layer
 # residual attention prefix: trainable tensor count / patterns come from the model config (hybrid_prefix).
-SCRIPT_DIR=/efs/kadocjiang/learning_kvcache_upstream/prefix_tuning/virtual_prefix/internal
-REPO_ROOT=/efs/kadocjiang/learning_kvcache_upstream
+REPO_ROOT=${REPO_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)}
+SCRIPT_DIR=$REPO_ROOT/prefix_tuning/virtual_prefix/internal
 VERL_ROOT="$REPO_ROOT/verl"
 EXPERIMENT_ROOT=${EXPERIMENT_ROOT:-$REPO_ROOT/outputs/prefix_composition_3domain_20260917}
 export NO_PROXY="localhost,127.0.0.1,${NO_PROXY:-}"

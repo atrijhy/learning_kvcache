@@ -1,11 +1,14 @@
 """Build an initial all-layer residual attention prefix model dir from base Qwen3.5-4B (base weights hard-linked).
 GDN layers get N_GDN soft tokens, full-attention layers N_ATTN; keys ~ N(0, 0.02), values = 0 (identity at init).
-Usage: build_allattn_model.py --base /root/kvmodels/Qwen3.5-4B --out DIR --gdn 512 --attn 64
+Usage: build_allattn_model.py --base /root/kvmodels/Qwen3.5-4B --out DIR --gdn 512 --attn 64 [--gdn-value-scale 0.01]
+--gdn-value-scale: effective GDN-branch values = scale * value tokens. Under Adam this is a per-branch lr multiplier;
+1.0 collapses formal training at step 2 (the first Adam step moves the GDN branch ~1000x more than A64), 0.01 is stable.
 (the author's sizes: GDN 512 / attention 64 -> Qwen3.5-4B-AllAttn-G512A64)"""
 import argparse, json, os, shutil, torch
 from safetensors.torch import save_file
 ap = argparse.ArgumentParser(); ap.add_argument("--base", required=True); ap.add_argument("--out", required=True)
 ap.add_argument("--gdn", type=int, default=512); ap.add_argument("--attn", type=int, default=64)
+ap.add_argument("--gdn-value-scale", type=float, default=0.01)
 ap.add_argument("--seed", type=int, default=20261104); a = ap.parse_args()
 ARCH = "Qwen3_5AllAttentionPrefixForConditionalGeneration"; PF = "residual_attention_prefix.safetensors"
 here = os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +27,8 @@ for i, t in enumerate(c["text_config"]["layer_types"]):
 save_file(st, os.path.join(a.out, PF), metadata={"format": "pt"})
 c["architectures"] = [ARCH]; c["auto_map"] = {"AutoModelForImageTextToText": "modeling_qwen3_5_all_attention_prefix." + ARCH}
 c["text_config"].update(residual_attention_prefix_num_virtual_tokens=a.attn, residual_gdn_prefix_num_virtual_tokens=a.gdn,
-                        residual_attention_prefix_key_init_std=0.02)
+                        residual_attention_prefix_key_init_std=0.02,
+                        residual_gdn_prefix_value_scale=a.gdn_value_scale)
 c["hybrid_prefix"] = {"method": "all_layer_residual_attention_prefix", "gdn_num_virtual_tokens": a.gdn,
                       "attention_num_virtual_tokens": a.attn, "trainable_tensor_count": len(st),
                       "trainable_numel": sum(v.numel() for v in st.values())}

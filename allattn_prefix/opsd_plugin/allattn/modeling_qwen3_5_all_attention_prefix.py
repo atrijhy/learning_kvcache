@@ -199,6 +199,9 @@ class Qwen3_5ResidualSoftPrefixGatedDeltaNet(qwen3_5.Qwen3_5GatedDeltaNet):
         self.prefix_value_tokens = torch.nn.Parameter(torch.zeros(self.num_prefix_tokens, self.hidden_size))
         torch.nn.init.normal_(self.prefix_key_tokens, mean=0.0,
                               std=float(getattr(config, "residual_attention_prefix_key_init_std", 0.02)))
+        # effective value tokens = scale * parameter. Under Adam a scale s acts as a per-group lr of s * lr for the GDN
+        # branch (Adam's first step moves every element by ~lr, and this branch is ~1000x more sensitive than A64)
+        self.prefix_value_scale = float(getattr(config, "residual_gdn_prefix_value_scale", 1.0))
         self._prefix_branch_out = None
         norm = self.norm
         norm_forward = norm.forward
@@ -217,7 +220,7 @@ class Qwen3_5ResidualSoftPrefixGatedDeltaNet(qwen3_5.Qwen3_5GatedDeltaNet):
         kd, vd = self.key_dim, self.value_dim
         rep = self.num_v_heads // self.num_k_heads
         key = F.linear(self.prefix_key_tokens.to(dtype), weight[kd:2 * kd].to(dtype))
-        value = F.linear(self.prefix_value_tokens.to(dtype), weight[2 * kd:2 * kd + vd].to(dtype))
+        value = F.linear((self.prefix_value_tokens * self.prefix_value_scale).to(dtype), weight[2 * kd:2 * kd + vd].to(dtype))
         key = key.view(self.num_prefix_tokens, self.num_k_heads, self.head_k_dim)
         if rep > 1:
             key = key.repeat_interleave(rep, dim=1)

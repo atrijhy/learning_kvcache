@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-sys.path.insert(0, "/efs/kadocjiang/learning_kvcache_upstream/prefix_tuning/virtual_prefix")
+sys.path.insert(0, os.environ.get("REPO_ROOT", str(Path(__file__).resolve().parents[3])) + "/prefix_tuning/virtual_prefix")
 from merge_prefix_checkpoint import _gather_tensor  # noqa: E402
 PF = "residual_attention_prefix.safetensors"
 ap = argparse.ArgumentParser(); ap.add_argument("--checkpoint", type=Path, required=True)

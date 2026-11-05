@@ -30,6 +30,7 @@ class Qwen3_5ResidualSoftPrefixGatedDeltaNet(qwen3_5.Qwen3_5GatedDeltaNet):
         hidden = config.hidden_size
         self.prefix_key_tokens = torch.nn.Parameter(torch.empty(self.num_prefix_tokens, hidden))
         self.prefix_value_tokens = torch.nn.Parameter(torch.zeros(self.num_prefix_tokens, hidden))
+        self.prefix_value_scale = float(getattr(config, "residual_gdn_prefix_value_scale", 1.0))  # see HF modeling file
         torch.nn.init.normal_(self.prefix_key_tokens, mean=0.0, std=0.02)
         for p in (self.prefix_key_tokens, self.prefix_value_tokens):
             set_weight_attrs(p, {"weight_loader": default_weight_loader})
@@ -41,7 +42,7 @@ class Qwen3_5ResidualSoftPrefixGatedDeltaNet(qwen3_5.Qwen3_5GatedDeltaNet):
         dtype = mixed_qkv.dtype
         w = self.in_proj_qkvz.weight                     # rows: q | k | v | z
         key = F.linear(self.prefix_key_tokens.to(dtype), w[kd:2 * kd]).view(-1, hk, dk)
-        value = F.linear(self.prefix_value_tokens.to(dtype), w[2 * kd:2 * kd + vd]).view(-1, hv, dv)
+        value = F.linear((self.prefix_value_tokens * self.prefix_value_scale).to(dtype), w[2 * kd:2 * kd + vd]).view(-1, hv, dv)
         query = mixed_qkv[:, :kd].reshape(-1, hk, dk)
         if rep > 1:
             query = query.repeat_interleave(rep, dim=1)

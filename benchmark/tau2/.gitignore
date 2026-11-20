@@ -1,2 +1,4 @@
 .venv/
+.venv-910c/
 official/
+*.log

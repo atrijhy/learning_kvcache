@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import subprocess
 from pathlib import Path
 
@@ -71,7 +72,8 @@ def _check_server(base_url: str, model_alias: str) -> None:
 def run_tau2(args) -> int:
     """统一入口的 tau2 分发目标。args 为 run_eval 的 argparse.Namespace。"""
     tau2_root = _tau2_root()
-    venv_dir = Path(os.getenv("TAU2_VENV", str(tau2_root / ".venv")))
+    default_venv = ".venv-910c" if platform.machine() == "aarch64" else ".venv"
+    venv_dir = Path(os.getenv("TAU2_VENV", str(tau2_root / default_venv)))
     official_root = Path(os.getenv("TAU2_OFFICIAL_ROOT", str(tau2_root / "official")))
 
     _ensure_ready(tau2_root, venv_dir, official_root)
@@ -99,10 +101,9 @@ def run_tau2(args) -> int:
     }
     agent_thinking = getattr(args, "tau2_agent_thinking", False)
     user_thinking = getattr(args, "tau2_user_thinking", False)
-    if not agent_thinking:
-        agent_llm_args["extra_body"] = {
-            "chat_template_kwargs": {"enable_thinking": False}
-        }
+    agent_llm_args["extra_body"] = {
+        "chat_template_kwargs": {"enable_thinking": agent_thinking}
+    }
     # The user simulator only needs to produce short conversational turns. Its
     # cap remains separate so explicitly enabling agent thinking does not make
     # user turns unexpectedly verbose.
@@ -183,6 +184,15 @@ def run_tau2(args) -> int:
         cmd += ["--task-ids", *str(args.task_ids).replace(",", " ").split()]
     # 外部 key 只通过子进程环境传递。命令行与产物只包含 api_base，不包含 key。
     env = dict(os.environ)
+    if env.get("TAU2_HTTP_PROXY"):
+        from urllib.parse import urlparse
+        env["HTTP_PROXY"] = env["TAU2_HTTP_PROXY"]
+        env["HTTPS_PROXY"] = env["TAU2_HTTP_PROXY"]
+        env["http_proxy"] = env["TAU2_HTTP_PROXY"]
+        env["https_proxy"] = env["TAU2_HTTP_PROXY"]
+        bypass = [env.get("NO_PROXY", ""), "localhost", "127.0.0.1", urlparse(base_url).hostname or ""]
+        env["NO_PROXY"] = ",".join(item for item in bypass if item)
+        env["no_proxy"] = env["NO_PROXY"]
     # Retail includes natural-language assertions.  Upstream defaults their
     # judge to GPT-4.1; route this judge to an external OpenAI-compatible
     # model (Volcano Ark deepseek by default) whenever its API key is present

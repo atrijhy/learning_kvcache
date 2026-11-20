@@ -1,5 +1,9 @@
 # tau2-bench
 
+Ascend 910C uses the same driver and pinned source, with an ARM `.venv-910c`
+selected by `benchmark/env.sh`. See [the 910C guide](../910C.md) for setup,
+native vLLM-Ascend serving, and the existing external Ark user/judge routes.
+
 Official [tau2-bench](https://github.com/sierra-research/tau2-bench) (τ²-bench),
 wired into the project's unified evaluation entry
 (`benchmark/eval/run_eval.py`). Simulation, the user-simulator, and scoring

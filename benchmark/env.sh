@@ -17,7 +17,13 @@ if [[ -f "$BENCHMARK_PROJECT_ROOT/.env" ]]; then
     unset BENCHMARK_RESTORE_ALLEXPORT
 fi
 
-export PROJECT_PYTHON="${PROJECT_PYTHON:-$BENCHMARK_PROJECT_ROOT/benchmark/.venv/bin/python}"
+if [[ $(uname -m) == aarch64 ]]; then
+    export PROJECT_PYTHON="${PROJECT_PYTHON:-/usr/local/miniconda3/envs/kvcache-eval/bin/python}"
+    export TAU2_VENV="${TAU2_VENV:-$BENCHMARK_PROJECT_ROOT/benchmark/tau2/.venv-910c}"
+    export TAU2_HTTP_PROXY="${TAU2_HTTP_PROXY-http://bamboo-proxy.jd.com:80}"
+else
+    export PROJECT_PYTHON="${PROJECT_PYTHON:-$BENCHMARK_PROJECT_ROOT/benchmark/.venv/bin/python}"
+fi
 export PATH="$BENCHMARK_PROJECT_ROOT/benchmark/runtime/docker:$PATH"
 export DOCKER_HOST="${DOCKER_HOST:-unix://$BENCHMARK_PROJECT_ROOT/benchmark/runtime/docker.sock}"
 export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,6.5.85.147"

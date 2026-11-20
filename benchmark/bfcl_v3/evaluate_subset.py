@@ -23,6 +23,8 @@ def main():
     parser.add_argument('--ids', required=True, type=Path)
     parser.add_argument('--subset-dir', required=True, type=Path)
     args, official_args = parser.parse_known_args()
+    import launch
+    launch.configure()
     from bfcl_eval.constants import eval_config
     requested = json.loads(args.ids.read_text())
     prompt_dir = args.subset_dir / 'data'

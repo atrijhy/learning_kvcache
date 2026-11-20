@@ -92,6 +92,8 @@ def parse_args() -> argparse.Namespace:
                          "API model id 由 --model（BFCL_API_MODEL_ID）独立指定。")
     ap.add_argument("--bfcl-model-key", default="Qwen/Qwen3-4B-FC",
                     help="BFCL 官方 model handler 注册名（决定 prompt 模板与解析）。")
+    ap.add_argument("--bfcl-data-dir", default=None,
+                    help="可选的版本固定题目目录；工具文档和答案默认沿用官方数据。")
     ap.add_argument("--bfcl-categories", default="all",
                     help="官方 test-category 或 collection，如 all/non_live/live/multi_turn。")
     ap.add_argument("--bfcl-include-input-log", action="store_true", default=True)

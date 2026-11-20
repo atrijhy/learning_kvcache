@@ -86,7 +86,10 @@ def _bfcl_cmd(
     official_root: Path,
     project_python: str,
     subcmd_args: List[str],
+    data_dir: str | None = None,
 ) -> List[str]:
+    if data_dir:
+        return [project_python, str(_bfcl_root() / "launch.py"), *subcmd_args]
     return [project_python, "-m", "bfcl_eval", *subcmd_args]
 
 
@@ -101,6 +104,7 @@ def _run_bfcl(
     args: List[str],
     api_model_id: str,
     subset_ids_file: str | None = None,
+    data_dir: str | None = None,
 ) -> None:
     env = dict(os.environ)
     env["PYTHONPATH"] = (
@@ -113,10 +117,14 @@ def _run_bfcl(
     env["VLLM_PORT"] = port
     # 经 api_model_id.patch 解耦：API model id 独立于 --local-model-path。
     env["BFCL_API_MODEL_ID"] = api_model_id
+    if data_dir:
+        env["BFCL_DATA_DIR"] = str(Path(data_dir).resolve())
+    else:
+        env.pop("BFCL_DATA_DIR", None)
     if "--num-threads" in args:
         thread_arg = args.index("--num-threads") + 1
         env["BFCL_NUM_THREADS"] = args[thread_arg]
-    command = _bfcl_cmd(official_root, project_python, args)
+    command = _bfcl_cmd(official_root, project_python, args, data_dir)
     if subset_ids_file:
         command = [project_python, str(bfcl_root / "evaluate_subset.py"),
                    "--ids", str(Path(subset_ids_file).resolve()),
@@ -185,6 +193,9 @@ def run_bfcl(args) -> int:
 
     categories = args.bfcl_categories
     model_key = args.bfcl_model_key
+    data_dir = getattr(args, "bfcl_data_dir", None)
+    if data_dir and not Path(data_dir).is_dir():
+        raise SystemExit(f"--bfcl-data-dir 不存在: {data_dir}")
 
     print("=" * 72)
     print("BFCL v3 (official pipeline)")
@@ -222,7 +233,7 @@ def run_bfcl(args) -> int:
     _run_bfcl(
         official_root=official_root, bfcl_root=bfcl_root, project_python=project_python,
         project_root_env=project_root_env, host=host, port=port, args=gen_args,
-        api_model_id=model_alias,
+        api_model_id=model_alias, data_dir=data_dir,
     )
 
     # 2) evaluate
@@ -237,6 +248,7 @@ def run_bfcl(args) -> int:
         official_root=official_root, bfcl_root=bfcl_root, project_python=project_python,
         project_root_env=project_root_env, host=host, port=port, args=eval_args,
         api_model_id=model_alias, subset_ids_file=run_ids_file,
+        data_dir=data_dir,
     )
 
     # 3) scores（绕开官方 scores 子命令的列崩溃）

@@ -9,12 +9,19 @@ cache.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen3_5
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
-from .joint_prefix_attention import full_attention_with_prefix, gdn_state_rows_attention
+from .joint_prefix_attention import (
+    flex_full_attention_with_prefix,
+    full_attention_with_prefix,
+    compiled_gdn_state_rows_attention,
+    gdn_state_rows_attention,
+)
 from .modeling_qwen3_5_independent_delta_kv_prefix import (
     Qwen3_5IndependentDeltaKVPrefixForConditionalGeneration,
 )
@@ -35,7 +42,10 @@ class Qwen3_5ResidualSoftPrefixAttention(Qwen3_5Attention):
         self.num_attention_heads = config.num_attention_heads
         self.joint_prefix = bool(getattr(config, "residual_attention_prefix_joint_softmax", False))
         if self.joint_prefix:
-            self.prefix_logit_bias = torch.nn.Parameter(torch.zeros(self.num_attention_heads))
+            initial_bias = -math.log(self.num_prefix_tokens) - 8.0
+            self.prefix_logit_bias = torch.nn.Parameter(
+                torch.full((self.num_attention_heads,), initial_bias)
+            )
         self.num_key_value_heads = config.num_key_value_heads
         self.prefix_key_tokens = torch.nn.Parameter(
             torch.empty(self.num_prefix_tokens, config.hidden_size)
@@ -172,18 +182,30 @@ class Qwen3_5ResidualSoftPrefixAttention(Qwen3_5Attention):
         if self.joint_prefix:
             prefix_key, prefix_value = self._get_prefix_key_value(query_states.dtype)
             options = dict(dropout=self.attention_dropout if self.training else 0.0, scale=self.scaling)
+            causal_attention = full_attention_with_prefix
+            if (
+                attention_mask is None
+                and self.config._attn_implementation == "flash_attention_2"
+                and query_states.is_cuda
+                and query_states.dtype in (torch.float16, torch.bfloat16)
+                and options["dropout"] == 0.0
+            ):
+                causal_attention = flex_full_attention_with_prefix
+                options.pop("dropout")
             cu_seqlens = kwargs.get("cu_seq_lens_q")
             if cu_seqlens is None:
-                attn_output = full_attention_with_prefix(
+                if attention_mask is not None:
+                    options["context_mask"] = attention_mask
+                attn_output = causal_attention(
                     query_states, key_states, value_states, prefix_key, prefix_value,
-                    self.prefix_logit_bias, context_mask=attention_mask, **options,
+                    self.prefix_logit_bias, **options,
                 )
             else:
                 if past_key_values is not None or attention_mask is not None:
                     raise ValueError("Packed joint prefix attention expects no cache or explicit mask")
                 boundaries = cu_seqlens.tolist()
                 attn_output = torch.cat([
-                    full_attention_with_prefix(
+                    causal_attention(
                         query_states[..., start:end, :], key_states[..., start:end, :],
                         value_states[..., start:end, :], prefix_key, prefix_value,
                         self.prefix_logit_bias, **options,
@@ -230,18 +252,44 @@ class Qwen3_5StateRowsPrefixGatedDeltaNet(qwen3_5.Qwen3_5GatedDeltaNet):
         self.prefix_state_temperature = torch.nn.Parameter(torch.ones(self.num_v_heads))
         self.prefix_state_bias = torch.nn.Parameter(torch.zeros(self.num_v_heads))
         torch.nn.init.normal_(self.prefix_state_key, std=0.02)
+        self._use_compiled_prefix = config._attn_implementation == "flash_attention_2"
+        self.register_buffer("_cached_state_prefix_key", None, persistent=False)
+        self.register_buffer("_cached_state_prefix_value", None, persistent=False)
+        self._state_prefix_cache_key = None
         self._native_chunk_rule = self.chunk_gated_delta_rule
         self._native_recurrent_rule = self.recurrent_gated_delta_rule
         self.chunk_gated_delta_rule = self._chunk_rule_with_prefix
         self.recurrent_gated_delta_rule = self._recurrent_rule_with_prefix
 
+    def _project_state_prefix(self):
+        if self.training or torch.is_grad_enabled():
+            return F.normalize(self.prefix_state_key.float(), dim=-1), self.prefix_state_value.float()
+        cache_key = (
+            self.prefix_state_key._version, self.prefix_state_value._version,
+            self.prefix_state_key.device, self.prefix_state_key.dtype,
+        )
+        if self._state_prefix_cache_key != cache_key:
+            self._cached_state_prefix_key = F.normalize(self.prefix_state_key.float(), dim=-1)
+            self._cached_state_prefix_value = self.prefix_state_value.float()
+            self._state_prefix_cache_key = cache_key
+        return self._cached_state_prefix_key, self._cached_state_prefix_value
+
     def _add_prefix(self, query, readout):
-        return gdn_state_rows_attention(
-            readout.transpose(1, 2), query.transpose(1, 2),
-            self.prefix_state_key, self.prefix_state_value,
-            self.prefix_state_temperature, self.prefix_state_bias,
-            clamp=(-80.0, 80.0),
-        ).transpose(1, 2)
+        query = query.transpose(1, 2)
+        readout = readout.transpose(1, 2)
+        clamp = (-80.0, 80.0)
+        if self._use_compiled_prefix and query.is_cuda:
+            prefix_key, prefix_value = self._project_state_prefix()
+            output = compiled_gdn_state_rows_attention()(
+                readout, query, prefix_key, prefix_value,
+                self.prefix_state_temperature, self.prefix_state_bias, clamp,
+            )
+        else:
+            output = gdn_state_rows_attention(
+                readout, query, self.prefix_state_key, self.prefix_state_value,
+                self.prefix_state_temperature, self.prefix_state_bias, clamp=clamp,
+            )
+        return output.transpose(1, 2)
 
     def _chunk_rule_with_prefix(self, query, key, value, **kwargs):
         readout, state = self._native_chunk_rule(query, key, value, **kwargs)

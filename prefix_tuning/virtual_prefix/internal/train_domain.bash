@@ -199,6 +199,13 @@ import importlib.util
 import json
 import sys
 
+with open(sys.argv[1], encoding="utf-8") as model_config:
+    config = json.load(model_config)
+if config["text_config"].get("residual_attention_prefix_joint_softmax", False):
+    raise SystemExit(
+        "Joint-softmax checkpoint is supported for Hugging Face training/export only. "
+        "The vLLM rollout backend does not support it yet."
+    )
 plugins = importlib.metadata.entry_points(group="vllm.general_plugins")
 if not any(p.value == "prefix_tuning.virtual_prefix.vllm_plugin:register" for p in plugins):
     raise SystemExit(f"Hybrid prefix vLLM plugin is missing in {sys.executable}; use the kvcache environment.")
@@ -211,7 +218,7 @@ if sys.argv[2] == "colocate_async":
         raise SystemExit("PARTIAL_OFF_POLICY_STRATEGY must be wait or drop.")
     if int(sys.argv[6]) < int(sys.argv[7]):
         raise SystemExit("PARTIAL_ROLLOUT_TARGET must be >= TRAIN_BATCH_SIZE.")
-c = json.load(open(sys.argv[1]))["hybrid_prefix"]
+c = config["hybrid_prefix"]
 assert c["trainable_tensor_count"] == 112
 print(c["trainable_numel"])
 PY

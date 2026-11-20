@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen3_5
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
+from .joint_prefix_attention import full_attention_with_prefix
 from .modeling_qwen3_5_independent_delta_kv_prefix import (
     Qwen3_5IndependentDeltaKVPrefixForConditionalGeneration,
 )
@@ -32,6 +33,9 @@ class Qwen3_5ResidualSoftPrefixAttention(Qwen3_5Attention):
                 "text_config.residual_attention_prefix_num_virtual_tokens must be positive"
             )
         self.num_attention_heads = config.num_attention_heads
+        self.joint_prefix = bool(getattr(config, "residual_attention_prefix_joint_softmax", False))
+        if self.joint_prefix:
+            self.prefix_logit_bias = torch.nn.Parameter(torch.zeros(self.num_attention_heads))
         self.num_key_value_heads = config.num_key_value_heads
         self.prefix_key_tokens = torch.nn.Parameter(
             torch.empty(self.num_prefix_tokens, config.hidden_size)
@@ -165,21 +169,45 @@ class Qwen3_5ResidualSoftPrefixAttention(Qwen3_5Attention):
                 key_states, value_states, self.layer_idx
             )
 
-        attention_interface = qwen3_5.ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation,
-            qwen3_5.eager_attention_forward,
-        )
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-        attn_output = attn_output + self._residual_prefix_attention(query_states)
+        if self.joint_prefix:
+            prefix_key, prefix_value = self._get_prefix_key_value(query_states.dtype)
+            options = dict(dropout=self.attention_dropout if self.training else 0.0, scale=self.scaling)
+            cu_seqlens = kwargs.get("cu_seq_lens_q")
+            if cu_seqlens is None:
+                attn_output = full_attention_with_prefix(
+                    query_states, key_states, value_states, prefix_key, prefix_value,
+                    self.prefix_logit_bias, context_mask=attention_mask, **options,
+                )
+            else:
+                if past_key_values is not None or attention_mask is not None:
+                    raise ValueError("Packed joint prefix attention expects no cache or explicit mask")
+                boundaries = cu_seqlens.tolist()
+                attn_output = torch.cat([
+                    full_attention_with_prefix(
+                        query_states[..., start:end, :], key_states[..., start:end, :],
+                        value_states[..., start:end, :], prefix_key, prefix_value,
+                        self.prefix_logit_bias, **options,
+                    )
+                    for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
+                ], dim=-2)
+            attn_output = attn_output.transpose(1, 2)
+            attn_weights = None
+        else:
+            attention_interface = qwen3_5.ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation,
+                qwen3_5.eager_attention_forward,
+            )
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+            attn_output = attn_output + self._residual_prefix_attention(query_states)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output), attn_weights

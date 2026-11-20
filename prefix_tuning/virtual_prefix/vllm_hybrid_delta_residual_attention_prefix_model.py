@@ -20,6 +20,8 @@ class Qwen3_5ResidualSoftPrefixAttention(ResidualPrefixAttentionMixin, Qwen3Next
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if getattr(self.config, "residual_attention_prefix_joint_softmax", False):
+            raise NotImplementedError("vLLM joint prefix attention is not implemented")
         self.num_prefix_tokens = int(
             getattr(
                 self.config,

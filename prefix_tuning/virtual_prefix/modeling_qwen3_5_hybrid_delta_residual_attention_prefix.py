@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen3_5
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
-from .joint_prefix_attention import full_attention_with_prefix
+from .joint_prefix_attention import full_attention_with_prefix, gdn_state_rows_attention
 from .modeling_qwen3_5_independent_delta_kv_prefix import (
     Qwen3_5IndependentDeltaKVPrefixForConditionalGeneration,
 )
@@ -213,6 +213,45 @@ class Qwen3_5ResidualSoftPrefixAttention(Qwen3_5Attention):
         return self.o_proj(attn_output), attn_weights
 
 
+class Qwen3_5StateRowsPrefixGatedDeltaNet(qwen3_5.Qwen3_5GatedDeltaNet):
+    """Compete with the native post-convolution readout without seeding its state."""
+
+    def __init__(self, config, layer_idx):
+        super().__init__(config, layer_idx)
+        count = int(config.independent_delta_prefix_num_virtual_tokens)
+        if count <= 0:
+            raise ValueError("GDN prefix length must be positive")
+        self.prefix_state_key = torch.nn.Parameter(
+            torch.empty(1, self.num_v_heads, count, self.head_k_dim)
+        )
+        self.prefix_state_value = torch.nn.Parameter(
+            torch.zeros(1, self.num_v_heads, count, self.head_v_dim)
+        )
+        self.prefix_state_temperature = torch.nn.Parameter(torch.ones(self.num_v_heads))
+        self.prefix_state_bias = torch.nn.Parameter(torch.zeros(self.num_v_heads))
+        torch.nn.init.normal_(self.prefix_state_key, std=0.02)
+        self._native_chunk_rule = self.chunk_gated_delta_rule
+        self._native_recurrent_rule = self.recurrent_gated_delta_rule
+        self.chunk_gated_delta_rule = self._chunk_rule_with_prefix
+        self.recurrent_gated_delta_rule = self._recurrent_rule_with_prefix
+
+    def _add_prefix(self, query, readout):
+        return gdn_state_rows_attention(
+            readout.transpose(1, 2), query.transpose(1, 2),
+            self.prefix_state_key, self.prefix_state_value,
+            self.prefix_state_temperature, self.prefix_state_bias,
+            clamp=(-80.0, 80.0),
+        ).transpose(1, 2)
+
+    def _chunk_rule_with_prefix(self, query, key, value, **kwargs):
+        readout, state = self._native_chunk_rule(query, key, value, **kwargs)
+        return self._add_prefix(query, readout), state
+
+    def _recurrent_rule_with_prefix(self, query, key, value, **kwargs):
+        readout, state = self._native_recurrent_rule(query, key, value, **kwargs)
+        return self._add_prefix(query, readout), state
+
+
 class Qwen3_5HybridDeltaResidualAttentionPrefixForConditionalGeneration(
     Qwen3_5IndependentDeltaKVPrefixForConditionalGeneration
 ):
@@ -225,6 +264,11 @@ class Qwen3_5HybridDeltaResidualAttentionPrefixForConditionalGeneration(
             super().__init__(config)
         finally:
             qwen3_5.Qwen3_5Attention = original_cls
+
+    def _delta_net_class(self, config):
+        if getattr(config.text_config, "residual_attention_prefix_joint_softmax", False):
+            return Qwen3_5StateRowsPrefixGatedDeltaNet
+        return super()._delta_net_class(config)
 
     def invalidate_residual_attention_prefix_caches(self) -> None:
         for module in self.modules():

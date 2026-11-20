@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start four two-GPU local-DP vLLM services for the formal rerun."""
+"""Start native vLLM services for Qwen3.5 GPU and Qwen3 Ascend prefix evaluation."""
 from __future__ import annotations
 
 import json
@@ -153,9 +153,77 @@ def status_services():
     return 0 if rows and all(item["healthy"] for item in rows) else 1
 
 
+def serve_qwen3_prefix(arguments):
+    """Use the same native vLLM plugin path for a Qwen3 checkpoint on Ascend."""
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", default="latest")
+    parser.add_argument("--model", default="/home/liyu.468/models/Qwen3-4B")
+    parser.add_argument("--device", default=None, help="Comma-separated Ascend device ids; default: 0..DP-1")
+    parser.add_argument("--data-parallel-size", type=int, default=1)
+    parser.add_argument("--data-parallel-rpc-port", type=int, default=18170)
+    parser.add_argument("--port", type=int, default=18160)
+    parser.add_argument("--max-model-len", type=int, default=65536)
+    parser.add_argument("--max-num-seqs", type=int, default=8)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None,
+                        help="Omit to use vLLM's default scheduling budget")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
+    parser.add_argument("--prepare-only", action="store_true")
+    args = parser.parse_args(arguments)
+    if args.data_parallel_size < 1:
+        parser.error("--data-parallel-size must be positive")
+    devices = args.device.split(",") if args.device is not None else [str(i) for i in range(args.data_parallel_size)]
+    if len(devices) != args.data_parallel_size or len(set(devices)) != len(devices) or not all(d.isdigit() for d in devices):
+        parser.error("Provide one unique Ascend device id per data-parallel rank")
+    device_mask = ",".join(devices)
+    sys.path.insert(0, str(ROOT))
+    from prefix_tuning.virtual_prefix.export_qwen3_residual_kv_prefix_checkpoint import checkpoint_path, export
+    checkpoint = checkpoint_path(args.checkpoint)
+    # The full SFT job owns all eight NPUs. Preparation only touches CPU/files.
+    if not args.prepare_only:
+        processes = subprocess.check_output(["ps", "-eo", "args="], text=True)
+        if any("train_qwen3_prefix_sft_full.py" in line for line in processes.splitlines()):
+            raise SystemExit("Full SFT is still active; vLLM was not started. Use --prepare-only or wait for training to finish.")
+    destination = checkpoint.parent / "vllm_exports" / f"{checkpoint.name}-ctx{args.max_model_len}"
+    if destination.exists():
+        manifest = json.loads((destination / "prefix_merge_manifest.json").read_text())
+        if manifest["source_checkpoint"] != str(checkpoint) or manifest["base_model"] != str(Path(args.model).resolve()):
+            raise RuntimeError(f"Export provenance mismatch: {destination}")
+    else:
+        export(checkpoint, args.model, destination, args.max_model_len)
+    command = [sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+               "--model", str(destination), "--model-impl", "vllm", "--dtype", "bfloat16",
+               "--served-model-name", "qwen3-kv-prefix", "--host", "127.0.0.1", "--port", str(args.port),
+               "--tensor-parallel-size", "1", "--max-model-len", str(args.max_model_len),
+               "--max-num-seqs", str(args.max_num_seqs),
+               "--enable-chunked-prefill",
+               "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+               "--enable-auto-tool-choice", "--tool-call-parser", "hermes", "--reasoning-parser", "qwen3",
+               "--default-chat-template-kwargs", '{"enable_thinking":true}', "--enforce-eager"]
+    if args.data_parallel_size > 1:
+        command.extend(["--data-parallel-size", str(args.data_parallel_size),
+                        "--data-parallel-size-local", str(args.data_parallel_size),
+                        "--data-parallel-backend", "mp", "--data-parallel-rpc-port", str(args.data_parallel_rpc_port)])
+    if args.max_num_batched_tokens is not None:
+        command.extend(["--max-num-batched-tokens", str(args.max_num_batched_tokens)])
+    env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=device_mask,
+               PYTHONPATH=f"{ROOT}:{os.environ.get('PYTHONPATH', '')}",
+               TOKENIZERS_PARALLELISM="false", HF_HUB_OFFLINE="1",
+               VLLM_WORKER_MULTIPROC_METHOD="spawn")
+    report = {"backend": "vllm-ascend", "export": str(destination), "checkpoint": str(checkpoint),
+              "devices": devices, "data_parallel_size": args.data_parallel_size, "command": command}
+    filename = "serve_plan.json" if args.prepare_only else "serve_config.json"
+    (destination / filename).write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, indent=2), flush=True)
+    if not args.prepare_only:
+        os.execvpe(command[0], command, env)
+
+
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "status"
-    if action == "start":
+    if action == "qwen3-prefix":
+        serve_qwen3_prefix(sys.argv[2:])
+    elif action == "start":
         start_services()
     elif action == "stop":
         stop_services()
@@ -165,4 +233,4 @@ if __name__ == "__main__":
     elif action == "status":
         raise SystemExit(status_services())
     else:
-        raise SystemExit("usage: eval_services.py {start|stop|restart|status}")
+        raise SystemExit("usage: eval_services.py {start|stop|restart|status|qwen3-prefix}")

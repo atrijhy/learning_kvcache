@@ -10,6 +10,8 @@ PYTHON=${KVCACHE_PYTHON:-/usr/local/miniconda3/envs/kvcache/bin/python}
 usage() {
     cat <<'EOF'
 Usage:
+  ./experiment.sh sft {prepare|train|prepare-full|train-full} [arguments ...]
+  ./experiment.sh serve qwen3-prefix [--checkpoint PATH] [arguments ...]
   ./experiment.sh tools {start|stop|restart|status} [awm|envscaler|taco ...]
   ./experiment.sh train all [--awm-resume CHECKPOINT]
   ./experiment.sh train {awm|envscaler|taco|mixed} [Hydra overrides ...]
@@ -260,6 +262,28 @@ PY
 command=${1:-help}
 shift || true
 case "$command" in
+    sft)
+        action=${1:-train}; shift || true
+        if [[ ! -x "$PYTHON" ]]; then
+            PYTHON=/usr/local/miniconda3/bin/python
+        fi
+        if [[ -f /usr/local/Ascend/cann-9.1.0/set_env.sh ]]; then
+            set +u
+            source /usr/local/Ascend/cann-9.1.0/set_env.sh
+            set -u
+        fi
+        export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
+        case "$action" in
+            prepare-full) exec "$PYTHON" "$ROOT/prefix_tuning/virtual_prefix/train_qwen3_prefix_sft_full.py" --prepare-only "$@" ;;
+            train-full)
+                exec "$PYTHON" -m torch.distributed.run --standalone --nproc_per_node=8 \
+                    "$ROOT/prefix_tuning/virtual_prefix/train_qwen3_prefix_sft_full.py" "$@"
+                ;;
+            prepare) exec "$PYTHON" "$ROOT/prefix_tuning/virtual_prefix/prepare_envscaler_sft.py" "$@" ;;
+            train) exec "$PYTHON" "$ROOT/prefix_tuning/virtual_prefix/train_qwen3_prefix_sft.py" "$@" ;;
+            *) echo "Use sft prepare, train, prepare-full, or train-full" >&2; exit 2 ;;
+        esac
+        ;;
     tools)
         activate_kvcache
         run_tools "$@"
@@ -283,6 +307,17 @@ case "$command" in
         exec bash "$INTERNAL/train_domain.bash" "$@"
         ;;
     serve)
+        if [[ ${1:-status} == qwen3-prefix ]]; then
+            shift
+            if [[ -f /usr/local/Ascend/cann-9.1.0/set_env.sh ]]; then
+                set +u
+                source /usr/local/Ascend/cann-9.1.0/set_env.sh
+                set -u
+            fi
+            export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
+            export LD_LIBRARY_PATH="/usr/local/miniconda3/lib:/usr/local/miniconda3/lib64:${LD_LIBRARY_PATH:-}"
+            exec "$PYTHON" "$INTERNAL/eval_services.py" qwen3-prefix "$@"
+        fi
         activate_kvcache
         exec "$PYTHON" "$INTERNAL/eval_services.py" "${1:-status}"
         ;;

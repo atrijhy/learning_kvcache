@@ -18,7 +18,16 @@ HYBRID_DELTA_RESIDUAL_ATTENTION_PREFIX_MODEL_CLASS = (
     "vllm_hybrid_delta_residual_attention_prefix_model:"
     "Qwen3_5HybridDeltaResidualAttentionPrefixForConditionalGeneration"
 )
+QWEN3_RESIDUAL_KV_PREFIX_ARCHITECTURE = "Qwen3ResidualKVPrefixForCausalLM"
+QWEN3_RESIDUAL_KV_PREFIX_MODEL_CLASS = (
+    "prefix_tuning.virtual_prefix.vllm_qwen3_residual_kv_prefix_model:"
+    "Qwen3ResidualKVPrefixForCausalLM"
+)
 def register() -> None:
+    ModelRegistry.register_model(
+        QWEN3_RESIDUAL_KV_PREFIX_ARCHITECTURE,
+        QWEN3_RESIDUAL_KV_PREFIX_MODEL_CLASS,
+    )
     ModelRegistry.register_model(
         INDEPENDENT_DELTA_KV_PREFIX_ARCHITECTURE,
         INDEPENDENT_DELTA_KV_PREFIX_MODEL_CLASS,

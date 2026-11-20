@@ -1,0 +1,108 @@
+"""Read a normalized episode or convert an older Claude event trace."""
+import argparse
+import json
+from pathlib import Path
+
+SYSTEM_PROMPT = ("Solve the current independent benchmark task. Each task starts with fresh state. "
+                 "Use only the tools offered for this task. For programming questions return Python in a fenced code block.")
+
+
+def initial_messages(question, thinking):
+    return [{"role": "system", "content": SYSTEM_PROMPT if thinking else SYSTEM_PROMPT + " /no_think"},
+            {"role": "user", "content": question}]
+
+
+class MessageStream:
+    def __init__(self, session_id, names):
+        self.session_id = session_id
+        self.names = names
+        self.turns = {}
+        self.calls = {}
+        self.results = {}
+
+    def accept(self, event):
+        role = event["type"]
+        if role not in ("assistant", "user"):
+            return False
+        if event.get("session_id") != self.session_id:
+            raise ValueError("Unexpected session ID")
+        message = event["message"]
+        blocks = message["content"]
+        if role == "user" and event.get("isSynthetic"):
+            # The CLI can inject continuation prompts and compaction summaries.
+            # Keep the original trajectory and any tool results in this event.
+            if isinstance(blocks, str):
+                return False
+            blocks = [block for block in blocks if block["type"] != "text"]
+            if not blocks:
+                return False
+        if role == "assistant":
+            turn = self.turns.setdefault(message["id"], {"role": "assistant", "content": ""})
+        for b in blocks:
+            kind = b["type"]
+            if role == "assistant" and kind == "tool_use":
+                name, call_id = b["name"], b["id"]
+                if call_id in self.calls or name not in self.names:
+                    raise ValueError(f"Duplicate call or missing schema for {name}")
+                self.calls[call_id] = name
+                turn.setdefault("tool_calls", []).append({"id": call_id, "type": "function",
+                    "function": {"name": name, "arguments": b["input"]}})
+            elif role == "user" and kind == "tool_result":
+                call_id = b["tool_use_id"]
+                if call_id not in self.calls or call_id in self.results:
+                    raise ValueError(f"Unmatched tool result {call_id}")
+                value = b["content"]
+                if isinstance(value, list):
+                    if any(part["type"] != "text" for part in value):
+                        raise ValueError("Unsupported non-text tool result")
+                    value = "\n".join(part["text"] for part in value)
+                self.results[call_id] = {"role": "tool", "name": self.calls[call_id],
+                                         "tool_call_id": call_id, "content": value}
+            elif role == "assistant" and kind == "thinking":
+                turn["reasoning_content"] = turn.get("reasoning_content", "") + b["thinking"]
+            elif role == "assistant" and kind == "text":
+                turn["content"] += b["text"]
+            else:
+                raise ValueError(f"Unexpected {role} content block {kind}")
+        return True
+
+    def messages(self):
+        for turn in self.turns.values():
+            yield turn
+            for call in turn.get("tool_calls", []):
+                if call["id"] in self.results:
+                    yield self.results[call["id"]]
+
+    def check_complete(self):
+        if self.calls.keys() != self.results.keys():
+            raise ValueError("Missing tool result in completed episode")
+
+
+def conversation(directory):
+    episode = json.loads((directory / "episode.json").read_text())
+    if episode["status"] != "scored":
+        raise ValueError(f"Episode status is {episode['status']}")
+    schemas = json.loads((directory / "tools.json").read_text())
+    tools = [{"type": "function", "function": {
+        "name": "mcp__episode__" + tool["name"], "description": tool["description"],
+        "parameters": tool["inputSchema"]}} for tool in schemas]
+    with (directory / "events.jsonl").open() as stream:
+        if episode.get("event_format") == "messages-v1":
+            messages = [json.loads(line) for line in stream]
+        else:
+            events = MessageStream(episode["session_id"], {t["function"]["name"] for t in tools})
+            for line in stream:
+                events.accept(json.loads(line))
+            events.check_complete()
+            messages = initial_messages(episode["task"], episode["thinking_enabled"]) + list(events.messages())
+    metadata = {k: episode[k] for k in ("domain", "scenario", "task_idx", "session_id", "finish")}
+    metadata["reward"] = episode["verifier"]["reward"]
+    return {"metadata": metadata, "tools": tools, "messages": messages}
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("episode", type=Path, help="Episode directory or its events.jsonl")
+    args = parser.parse_args()
+    directory = args.episode.parent if args.episode.is_file() else args.episode
+    print(json.dumps(conversation(directory), ensure_ascii=False))

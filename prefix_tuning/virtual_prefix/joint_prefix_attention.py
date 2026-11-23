@@ -99,7 +99,16 @@ def flex_full_attention_with_prefix(query, key, value, prefix_key, prefix_value,
     def score_with_prefix_bias(score, batch_index, head, query_index, key_index):
         return score + torch.where(key_index < prefix_length, prefix_bias[head], 0.0)
 
+    # Large default tiles can exceed H100 shared memory at head dimension 256.
+    # Force the general kernel so the tile is also valid for short GQA queries.
+    kernel_options = None
+    if query.shape[-1] == 256:
+        kernel_options = {
+            "BLOCK_M": 32, "BLOCK_N": 32, "num_stages": 1,
+            "FORCE_USE_FLEX_ATTENTION": True,
+        }
     return _compiled_flex_attention()(
         query, joint_key, joint_value, score_mod=score_with_prefix_bias,
         block_mask=mask, scale=scale, enable_gqa=query.shape[1] != key.shape[1],
+        kernel_options=kernel_options,
     )

@@ -12,7 +12,9 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
-from .joint_prefix_attention import compiled_gdn_state_rows_attention
+from .joint_prefix_attention import (
+    compiled_gdn_anchored_attention, compiled_gdn_state_rows_attention, compiled_gdn_token_null_attention,
+)
 from .vllm_independent_delta_kv_prefix_model import Qwen3_5GatedDeltaNet
 
 
@@ -25,6 +27,7 @@ class JointPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
             raise ValueError("Joint prefix rollout requires tensor parallel size 1")
         config = kwargs.get("config", args[0] if args else None)
         count = config.independent_delta_prefix_num_virtual_tokens
+        self.prefix_mode = getattr(config, "independent_delta_prefix_method", "state_rows_joint_softmax")
         self.prefix_state_key = torch.nn.Parameter(
             torch.empty(1, self.num_v_heads, count, self.head_k_dim)
         )
@@ -33,6 +36,12 @@ class JointPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
         )
         self.prefix_state_temperature = torch.nn.Parameter(torch.ones(self.num_v_heads))
         self.prefix_state_bias = torch.nn.Parameter(torch.zeros(self.num_v_heads))
+        if self.prefix_mode == "token_null_additive":
+            self.prefix_null_proj = torch.nn.Parameter(
+                torch.zeros(self.num_v_heads, config.hidden_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+            set_weight_attrs(self.prefix_null_proj, {"weight_loader": default_weight_loader})
         for parameter in (
             self.prefix_state_key, self.prefix_state_value,
             self.prefix_state_temperature, self.prefix_state_bias,
@@ -46,6 +55,15 @@ class JointPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
         self.chunk_gated_delta_rule.register_forward_pre_hook(
             self._capture_prefill_query, with_kwargs=True,
         )
+
+    def forward(self, hidden_states, *args, **kwargs):
+        if self.prefix_mode != "token_null_additive":
+            return super().forward(hidden_states, *args, **kwargs)
+        self._null_projection = F.linear(hidden_states.float(), self.prefix_null_proj.float())
+        try:
+            return super().forward(hidden_states, *args, **kwargs)
+        finally:
+            self._null_projection = None
 
     def _capture_prefill_query(self, module, args, kwargs):
         self._post_conv_query = kwargs["q"]
@@ -117,12 +135,24 @@ class JointPrefixGatedDeltaNet(Qwen3_5GatedDeltaNet):
         if query.shape[2] != self.num_v_heads:
             query = query.repeat_interleave(self.num_v_heads // query.shape[2], dim=2)
         readout = core_attn_out[:metadata.num_actual_tokens]
-        joint = compiled_gdn_state_rows_attention()(
-            readout.transpose(0, 1).unsqueeze(0), query.transpose(1, 2),
-            self._joint_key, self._joint_value,
-            self.prefix_state_temperature, self.prefix_state_bias, (-80.0, 80.0),
-        )
-        readout.copy_(joint[0].transpose(0, 1))
+        if self.prefix_mode == "token_null_additive":
+            null = self._null_projection[:metadata.num_actual_tokens].transpose(0, 1)[None, :, :, None]
+            contribution, _, _ = compiled_gdn_token_null_attention()(
+                query.transpose(1, 2), self._joint_key, self._joint_value, self.prefix_state_bias, null,
+            )
+            readout.add_(contribution[0].transpose(0, 1).to(readout.dtype))
+        elif self.prefix_mode == "anchored_additive":
+            contribution, _ = compiled_gdn_anchored_attention()(
+                query.transpose(1, 2), self._joint_key, self._joint_value, self.prefix_state_bias,
+            )
+            readout.add_(contribution[0].transpose(0, 1).to(readout.dtype))
+        else:
+            joint = compiled_gdn_state_rows_attention()(
+                readout.transpose(0, 1).unsqueeze(0), query.transpose(1, 2),
+                self._joint_key, self._joint_value,
+                self.prefix_state_temperature, self.prefix_state_bias, (-80.0, 80.0),
+            )
+            readout.copy_(joint[0].transpose(0, 1))
 
 
 class JointPrefixFlashAttention(FlashAttentionImpl):
@@ -141,9 +171,11 @@ class JointPrefixFlashAttention(FlashAttentionImpl):
         metadata = attn_metadata
         count = metadata.num_actual_tokens
         live_query = query[:count]
+        mode = getattr(prefix.config, "residual_attention_prefix_mode", "joint")
+        anchored = mode in ("anchored_additive", "token_null_additive")
         key_cache, value_cache = kv_cache.unbind(0)
         descale_shape = (metadata.query_start_loc.shape[0] - 1, self.num_kv_heads)
-        ctx, ctx_lse = flash_attn_varlen_func(
+        ctx_result = flash_attn_varlen_func(
             q=live_query, k=key_cache, v=value_cache,
             cu_seqlens_q=metadata.query_start_loc, max_seqlen_q=metadata.max_query_len,
             seqused_k=metadata.seq_lens, max_seqlen_k=metadata.max_seq_len,
@@ -153,7 +185,7 @@ class JointPrefixFlashAttention(FlashAttentionImpl):
             q_descale=layer._q_scale.expand(descale_shape),
             k_descale=layer._k_scale.expand(descale_shape),
             v_descale=layer._v_scale.expand(descale_shape),
-            return_softmax_lse=True,
+            return_softmax_lse=not anchored,
         )
         # Flattening queries is valid here because every request reads the same
         # immutable prefix and noncausal attention treats query rows independently.
@@ -165,5 +197,12 @@ class JointPrefixFlashAttention(FlashAttentionImpl):
             return_softmax_lse=True,
         )
         pref_lse = (pref_lse + prefix.prefix_logit_bias.float()[:, None]).contiguous()
-        merge_attn_states(output[:count], pref, pref_lse, ctx, ctx_lse.contiguous())
+        if mode == "token_null_additive":
+            pref_lse = pref_lse - prefix._null_projection[:count].transpose(0, 1)
+        if anchored:
+            weight = pref_lse.sigmoid().transpose(0, 1).unsqueeze(-1)
+            output[:count].copy_((ctx_result.float() + weight * pref.float()).to(output.dtype))
+        else:
+            ctx, ctx_lse = ctx_result
+            merge_attn_states(output[:count], pref, pref_lse, ctx, ctx_lse.contiguous())
         return output

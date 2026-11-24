@@ -44,9 +44,17 @@ def main() -> None:
     parser.add_argument("--num-attention-prefix-tokens", type=int, default=256)
     parser.add_argument("--key-init-std", type=float, default=0.02)
     parser.add_argument("--joint-softmax", action="store_true")
+    parser.add_argument("--attention-prefix-mode", choices=("joint", "anchored_additive", "token_null_additive"), default="joint")
+    parser.add_argument("--gdn-prefix-mode", choices=("state_rows_joint_softmax", "anchored_additive", "token_null_additive"),
+                        default="state_rows_joint_softmax")
     parser.add_argument("--seed", type=int, default=20260821)
     parser.add_argument("--copy-mode", choices=("hardlink", "copy"), default="hardlink")
     args = parser.parse_args()
+    if args.attention_prefix_mode != "joint" and not args.joint_softmax:
+        parser.error("Additive attention requires --joint-softmax")
+    anchored_gdn = args.gdn_prefix_mode != "state_rows_joint_softmax"
+    if anchored_gdn and not args.joint_softmax:
+        parser.error("--gdn-prefix-mode anchored_additive requires --joint-softmax")
 
     source = args.source.resolve()
     output = args.output.resolve()
@@ -98,7 +106,10 @@ def main() -> None:
                     1, gdn_heads, delta_tokens, gdn_value_dim, dtype=torch.bfloat16,
                 )
                 delta_weights[f"{base}.prefix_state_temperature"] = torch.ones(gdn_heads)
-                delta_weights[f"{base}.prefix_state_bias"] = torch.zeros(gdn_heads)
+                bias = -math.log(delta_tokens) - 8.0 if anchored_gdn else 0.0
+                delta_weights[f"{base}.prefix_state_bias"] = torch.full((gdn_heads,), bias)
+                if args.gdn_prefix_mode == "token_null_additive":
+                    delta_weights[f"{base}.prefix_null_proj"] = torch.zeros(gdn_heads, hidden_size)
             continue
         full_attention_layer_indices.append(layer_idx)
         base = f"model.language_model.layers.{layer_idx}.self_attn"
@@ -119,6 +130,8 @@ def main() -> None:
             attention_weights[f"{base}.prefix_logit_bias"] = torch.full(
                 (attention_heads,), initial_bias,
             )
+            if args.attention_prefix_mode == "token_null_additive":
+                attention_weights[f"{base}.prefix_null_proj"] = torch.zeros(attention_heads, hidden_size)
     save_file(attention_weights, output / ATTENTION_WEIGHTS_FILE)
 
     index_path = output / "model.safetensors.index.json"
@@ -140,13 +153,15 @@ def main() -> None:
         delta_path = output / DELTA_WEIGHTS_FILE
         delta_path.unlink()
         save_file(delta_weights, delta_path)
-        delta_numel = sum(tensor.numel() for tensor in delta_weights.values())
+        trained_delta = {name: tensor for name, tensor in delta_weights.items()
+                         if not (anchored_gdn and name.endswith(".prefix_state_temperature"))}
+        delta_numel = sum(tensor.numel() for tensor in trained_delta.values())
         delta_bytes_change = sum(t.numel() * t.element_size() for t in delta_weights.values()) - sum(
             t.numel() * t.element_size() for t in legacy_weights.values()
         )
         delta_metadata.update(
-            method="state_rows_joint_softmax",
-            trainable_tensor_count=len(delta_weights),
+            method=args.gdn_prefix_mode,
+            trainable_tensor_count=len(trained_delta),
             trainable_numel=delta_numel,
         )
         (output / "independent_delta_kv_prefix_config.json").write_text(
@@ -170,6 +185,9 @@ def main() -> None:
     )
     text_config["residual_attention_prefix_key_init_std"] = args.key_init_std
     text_config["residual_attention_prefix_joint_softmax"] = args.joint_softmax
+    text_config["residual_attention_prefix_mode"] = args.attention_prefix_mode
+    if args.joint_softmax:
+        text_config["independent_delta_prefix_method"] = args.gdn_prefix_mode
     metadata = {
         "method": "residual_soft_prefix_attention_independent_hidden_kv",
         "full_attention_layer_indices": full_attention_layer_indices,
@@ -182,7 +200,8 @@ def main() -> None:
             -1,
         ],
         "insertion": "before_native_query_gate_and_output_projection",
-        "joint_softmax_with_user_attention": args.joint_softmax,
+        "joint_softmax_with_user_attention": args.joint_softmax and args.attention_prefix_mode == "joint",
+        "attention_prefix_mode": args.attention_prefix_mode,
         "uses_user_kv_cache": False,
         "trainable_tensor_count": len(attention_weights),
         "trainable_numel": attention_numel,

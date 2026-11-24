@@ -17,6 +17,12 @@ from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen3_5
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
 from .joint_prefix_attention import (
+    anchored_prefix_attention,
+    compiled_gdn_anchored_attention,
+    compiled_gdn_token_null_attention,
+    gdn_anchored_attention,
+    gdn_token_null_attention,
+    token_null_attention,
     flex_full_attention_with_prefix,
     full_attention_with_prefix,
     compiled_gdn_state_rows_attention,
@@ -41,11 +47,18 @@ class Qwen3_5ResidualSoftPrefixAttention(Qwen3_5Attention):
             )
         self.num_attention_heads = config.num_attention_heads
         self.joint_prefix = bool(getattr(config, "residual_attention_prefix_joint_softmax", False))
+        self.prefix_mode = getattr(config, "residual_attention_prefix_mode", "joint")
+        if self.prefix_mode not in ("joint", "anchored_additive", "token_null_additive"):
+            raise ValueError(f"Unknown full-attention prefix mode: {self.prefix_mode}")
+        if self.prefix_mode != "joint" and not self.joint_prefix:
+            raise ValueError("Anchored additive attention requires a joint-softmax hybrid checkpoint")
         if self.joint_prefix:
             initial_bias = -math.log(self.num_prefix_tokens) - 8.0
             self.prefix_logit_bias = torch.nn.Parameter(
                 torch.full((self.num_attention_heads,), initial_bias)
             )
+        if self.prefix_mode == "token_null_additive":
+            self.prefix_null_proj = torch.nn.Parameter(torch.zeros(self.num_attention_heads, config.hidden_size))
         self.num_key_value_heads = config.num_key_value_heads
         self.prefix_key_tokens = torch.nn.Parameter(
             torch.empty(self.num_prefix_tokens, config.hidden_size)
@@ -179,7 +192,8 @@ class Qwen3_5ResidualSoftPrefixAttention(Qwen3_5Attention):
                 key_states, value_states, self.layer_idx
             )
 
-        if self.joint_prefix:
+        enabled = not getattr(self, "prefix_disabled", False)
+        if enabled and self.joint_prefix and self.prefix_mode == "joint":
             prefix_key, prefix_value = self._get_prefix_key_value(query_states.dtype)
             options = dict(dropout=self.attention_dropout if self.training else 0.0, scale=self.scaling)
             causal_attention = full_attention_with_prefix
@@ -229,7 +243,26 @@ class Qwen3_5ResidualSoftPrefixAttention(Qwen3_5Attention):
                 scaling=self.scaling,
                 **kwargs,
             )
-            attn_output = attn_output + self._residual_prefix_attention(query_states)
+            if enabled and self.prefix_mode in ("anchored_additive", "token_null_additive"):
+                key, value = self._get_prefix_key_value(query_states.dtype)
+                if self.prefix_mode == "token_null_additive":
+                    null = F.linear(hidden_states.float(), self.prefix_null_proj.float()).transpose(1, 2).unsqueeze(-1)
+                    prefix_output, mass, raw_lse = token_null_attention(
+                        query_states, key, value, self.prefix_logit_bias, null, scale=self.scaling,
+                    )
+                    calibration = getattr(self, "prefix_calibration", None)
+                    if calibration is not None:
+                        calibration(raw_lse.detach())
+                else:
+                    prefix_output, mass = anchored_prefix_attention(
+                        query_states, key, value, self.prefix_logit_bias, scale=self.scaling,
+                    )
+                monitor = getattr(self, "prefix_monitor", None)
+                if monitor is not None:
+                    monitor(mass.detach(), prefix_output.detach(), attn_output.detach())
+                attn_output = attn_output + prefix_output.transpose(1, 2).to(attn_output.dtype)
+            elif enabled:
+                attn_output = attn_output + self._residual_prefix_attention(query_states)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output), attn_weights
@@ -250,7 +283,14 @@ class Qwen3_5StateRowsPrefixGatedDeltaNet(qwen3_5.Qwen3_5GatedDeltaNet):
             torch.zeros(1, self.num_v_heads, count, self.head_v_dim)
         )
         self.prefix_state_temperature = torch.nn.Parameter(torch.ones(self.num_v_heads))
-        self.prefix_state_bias = torch.nn.Parameter(torch.zeros(self.num_v_heads))
+        self.prefix_mode = getattr(config, "independent_delta_prefix_method", "state_rows_joint_softmax")
+        self.anchored_prefix = self.prefix_mode in ("anchored_additive", "token_null_additive")
+        if self.anchored_prefix:
+            self.prefix_state_temperature.requires_grad_(False)
+        initial_bias = -math.log(count) - 8.0 if self.anchored_prefix else 0.0
+        self.prefix_state_bias = torch.nn.Parameter(torch.full((self.num_v_heads,), initial_bias))
+        if self.prefix_mode == "token_null_additive":
+            self.prefix_null_proj = torch.nn.Parameter(torch.zeros(self.num_v_heads, config.hidden_size))
         torch.nn.init.normal_(self.prefix_state_key, std=0.02)
         self._use_compiled_prefix = config._attn_implementation == "flash_attention_2"
         self.register_buffer("_cached_state_prefix_key", None, persistent=False)
@@ -274,9 +314,37 @@ class Qwen3_5StateRowsPrefixGatedDeltaNet(qwen3_5.Qwen3_5GatedDeltaNet):
             self._state_prefix_cache_key = cache_key
         return self._cached_state_prefix_key, self._cached_state_prefix_value
 
+    def forward(self, hidden_states, *args, **kwargs):
+        if self.prefix_mode != "token_null_additive" or getattr(self, "prefix_disabled", False):
+            return super().forward(hidden_states, *args, **kwargs)
+        self._null_projection = F.linear(hidden_states.float(), self.prefix_null_proj.float()).transpose(1, 2).unsqueeze(-1)
+        try:
+            return super().forward(hidden_states, *args, **kwargs)
+        finally:
+            self._null_projection = None
+
     def _add_prefix(self, query, readout):
+        if getattr(self, "prefix_disabled", False):
+            return readout
         query = query.transpose(1, 2)
         readout = readout.transpose(1, 2)
+        if self.anchored_prefix:
+            key, value = self._project_state_prefix()
+            attention = (compiled_gdn_anchored_attention() if self._use_compiled_prefix and query.is_cuda
+                         else gdn_anchored_attention)
+            if self.prefix_mode == "token_null_additive":
+                attention = (compiled_gdn_token_null_attention() if self._use_compiled_prefix and query.is_cuda
+                             else gdn_token_null_attention)
+                contribution, mass, raw_lse = attention(query, key, value, self.prefix_state_bias, self._null_projection)
+                calibration = getattr(self, "prefix_calibration", None)
+                if calibration is not None:
+                    calibration(raw_lse.detach())
+            else:
+                contribution, mass = attention(query, key, value, self.prefix_state_bias)
+            monitor = getattr(self, "prefix_monitor", None)
+            if monitor is not None:
+                monitor(mass.detach(), contribution.detach(), readout.detach().transpose(1, 2))
+            return (readout + contribution.to(readout.dtype)).transpose(1, 2)
         clamp = (-80.0, 80.0)
         if self._use_compiled_prefix and query.is_cuda:
             prefix_key, prefix_value = self._project_state_prefix()

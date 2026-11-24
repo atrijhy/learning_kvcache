@@ -68,6 +68,8 @@ async def generate_jobs(jobs, args, path):
         max_keepalive_connections=max(16, args.concurrency),
     )
     api_timeout = getattr(args, "code_api_timeout", args.step_timeout)
+    experience = os.environ.get("SFT_T0_EXPERIENCE_TEXT")
+    system = [{"role": "system", "content": experience}] if experience else []
     async with AsyncOpenAI(base_url=args.openai_base_url,
                            api_key=os.environ.get("CODE_EVAL_API_KEY", "EMPTY"),
                            timeout=api_timeout, max_retries=2,
@@ -81,7 +83,7 @@ async def generate_jobs(jobs, args, path):
                 usage = None
                 try:
                     response = await client.chat.completions.create(
-                        model=args.model, messages=[{"role": "user", "content": task["prompt"]}],
+                        model=args.model, messages=[*system, {"role": "user", "content": task["prompt"]}],
                         temperature=args.temperature, top_p=args.top_p,
                         max_tokens=args.llm_max_completion_tokens or 16384,
                         **sampling_options(args, sample_index),

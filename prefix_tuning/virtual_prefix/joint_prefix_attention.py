@@ -34,6 +34,59 @@ def compiled_gdn_state_rows_attention():
     return torch.compile(_gdn_state_rows_attention, fullgraph=True)
 
 
+def anchored_prefix_attention(query, key, value, bias, *, scale):
+    """Return the additive prefix contribution and its mass against a zero logit."""
+    groups = query.shape[1] // key.shape[1]
+    key = key.repeat_interleave(groups, dim=1)
+    value = value.repeat_interleave(groups, dim=1)
+    logits = (query @ key.transpose(-1, -2)).float() * scale
+    return _anchored_read(logits, value, bias)
+
+
+def _anchored_read(logits, value, bias):
+    logits = logits + bias.float()[None, :, None, None]
+    prefix_lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+    lse = torch.logaddexp(prefix_lse, torch.zeros_like(prefix_lse))
+    weights = (logits - lse).exp()
+    return weights.to(value.dtype) @ value, prefix_lse.sigmoid()
+
+
+def gdn_anchored_attention(query, normalized_key, value, bias):
+    logits = F.normalize(query.float(), dim=-1) @ normalized_key.transpose(-1, -2)
+    return _anchored_read(logits * math.sqrt(query.shape[-1]), value, bias)
+
+
+@lru_cache(maxsize=1)
+def compiled_gdn_anchored_attention():
+    return torch.compile(gdn_anchored_attention, fullgraph=True, dynamic=True)
+
+
+def _token_null_read(scores, value, bias, null_projection):
+    raw_lse = torch.logsumexp(scores, dim=-1, keepdim=True)
+    shift = bias.float()[None, :, None, None] - null_projection.float()
+    lse = raw_lse + shift
+    weights = (scores + shift - torch.logaddexp(lse, torch.zeros_like(lse))).exp()
+    return weights @ value.float(), lse.sigmoid(), raw_lse
+
+
+def token_null_attention(query, key, value, bias, null_projection, *, scale):
+    groups = query.shape[1] // key.shape[1]
+    key = key.repeat_interleave(groups, dim=1)
+    value = value.repeat_interleave(groups, dim=1)
+    return _token_null_read((query.float() @ key.float().transpose(-1, -2)) * scale,
+                            value, bias, null_projection)
+
+
+def gdn_token_null_attention(query, normalized_key, value, bias, null_projection):
+    scores = F.normalize(query.float(), dim=-1) @ normalized_key.transpose(-1, -2)
+    return _token_null_read(scores * math.sqrt(query.shape[-1]), value, bias, null_projection)
+
+
+@lru_cache(maxsize=1)
+def compiled_gdn_token_null_attention():
+    return torch.compile(gdn_token_null_attention, fullgraph=True, dynamic=True)
+
+
 def full_attention_with_prefix(query, key, value, prefix_key, prefix_value, prefix_bias,
                                *, context_mask=None, dropout=0.0, scale=None):
     """Joint causal attention over negative-position prefix and user K/V."""

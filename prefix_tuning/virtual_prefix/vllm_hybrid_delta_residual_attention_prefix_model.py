@@ -6,6 +6,7 @@ from importlib.metadata import version
 from weakref import ref
 
 import torch
+import torch.nn.functional as F
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models import qwen3_5
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
@@ -24,6 +25,7 @@ class Qwen3_5ResidualSoftPrefixAttention(ResidualPrefixAttentionMixin, Qwen3Next
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.joint_prefix = bool(getattr(self.config, "residual_attention_prefix_joint_softmax", False))
+        self.token_null_prefix = getattr(self.config, "residual_attention_prefix_mode", "joint") == "token_null_additive"
         self.num_prefix_tokens = int(
             getattr(
                 self.config,
@@ -67,6 +69,12 @@ class Qwen3_5ResidualSoftPrefixAttention(ResidualPrefixAttentionMixin, Qwen3Next
                 raise ValueError("Joint prefix rollout requires FlashAttention 3 and an unquantized KV cache")
             self.prefix_logit_bias = torch.nn.Parameter(torch.zeros(self.num_heads))
             set_weight_attrs(self.prefix_logit_bias, {"weight_loader": default_weight_loader})
+            if self.token_null_prefix:
+                self.prefix_null_proj = torch.nn.Parameter(
+                    torch.zeros(self.num_heads, self.hidden_size, dtype=torch.float32),
+                    requires_grad=False,
+                )
+                set_weight_attrs(self.prefix_null_proj, {"weight_loader": default_weight_loader})
             self.register_buffer("_joint_offsets", None, persistent=False)
             self.register_buffer("_joint_key_offsets", None, persistent=False)
             impl.__class__ = JointPrefixFlashAttention
@@ -141,7 +149,14 @@ class Qwen3_5ResidualSoftPrefixAttention(ResidualPrefixAttentionMixin, Qwen3Next
         )
         q, k = self.rotary_emb(positions, q, k)
 
-        attn_output = self.attn(q, k, v)
+        if self.token_null_prefix:
+            self._null_projection = F.linear(hidden_states.float(), self.prefix_null_proj.float())
+            try:
+                attn_output = self.attn(q, k, v)
+            finally:
+                self._null_projection = None
+        else:
+            attn_output = self.attn(q, k, v)
         if not self.joint_prefix:
             query = q.view(-1, self.num_heads, self.head_dim)
             attn_output = attn_output + self._residual_prefix_attention(query)
@@ -203,7 +218,7 @@ class Qwen3_5HybridDeltaResidualAttentionPrefixForConditionalGeneration(
         suffixes = (".prefix_key_tokens", ".prefix_value_tokens")
         if self.joint_prefix:
             suffixes += (".prefix_logit_bias", ".prefix_state_key", ".prefix_state_value",
-                         ".prefix_state_temperature", ".prefix_state_bias")
+                         ".prefix_state_temperature", ".prefix_state_bias", ".prefix_null_proj")
         expected = {
             name
             for name, _ in self.named_parameters()

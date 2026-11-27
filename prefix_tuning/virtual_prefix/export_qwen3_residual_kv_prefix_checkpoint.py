@@ -41,9 +41,16 @@ def export(checkpoint, base_model, output, max_length=65536):
         raise FileExistsError(f"Refusing to overwrite {output}")
     config = json.loads((base_model / "config.json").read_text())
     prefix_config = json.loads((checkpoint / "prefix_config.json").read_text())
-    if config.get("model_type") != "qwen3" or prefix_config.get("method") != "qwen3_residual_kv_prefix":
-        raise ValueError("Expected Qwen3 base model and residual KV prefix checkpoint")
+    if config.get("model_type") != "qwen3" or prefix_config.get("method") not in (
+        "qwen3_residual_kv_prefix", "qwen3_nope_token_joint", "qwen3_nope_token_null_additive"
+    ):
+        raise ValueError("Expected Qwen3 base model and residual/nope_token_joint/nope_token_null_additive KV prefix checkpoint")
+    mode = prefix_config.get("attention_mode", "residual")
     count = prefix_config["num_virtual_tokens"]
+    branch_sizes = prefix_config.get("branch_sizes", [count])
+    num_branches = len(branch_sizes)
+    if sum(branch_sizes) != count:
+        raise ValueError(f"Invalid branch_sizes {branch_sizes} vs count {count}")
     if not isinstance(count, int) or count <= 0:
         raise ValueError("Invalid prefix length")
     if max_length <= 0:
@@ -52,13 +59,25 @@ def export(checkpoint, base_model, output, max_length=65536):
     if rope.get("rope_type", rope.get("type", "default")) != "default":
         raise ValueError("The trained negative-position prefix requires default RoPE")
     state = load_file(str(checkpoint / "model.safetensors"), device="cpu")
-    names = {f"model.layers.{i}.self_attn.prefix_{kind}_tokens"
-             for i in range(config["num_hidden_layers"]) for kind in ["key", "value"]}
+    expected_shapes = {}
+    for i in range(config["num_hidden_layers"]):
+        base_p = f"model.layers.{i}.self_attn"
+        expected_shapes[f"{base_p}.prefix_key_tokens"] = [count, config["hidden_size"]]
+        expected_shapes[f"{base_p}.prefix_value_tokens"] = [count, config["hidden_size"]]
+        if mode in ("nope_token_joint", "nope_token_null_additive"):
+            expected_shapes[f"{base_p}.prefix_logit_bias"] = (
+                [num_branches, config["num_attention_heads"]] if num_branches > 1 else [config["num_attention_heads"]]
+            )
+            expected_shapes[f"{base_p}.prefix_null_proj"] = (
+                [num_branches, config["num_attention_heads"], config["hidden_size"]]
+                if num_branches > 1 else [config["num_attention_heads"], config["hidden_size"]]
+            )
+    names = set(expected_shapes)
     if set(state) != names:
         raise ValueError("Checkpoint prefix names do not match the base model layers")
     for name, tensor in state.items():
-        if list(tensor.shape) != [count, config["hidden_size"]] or not torch.isfinite(tensor).all():
-            raise ValueError(f"Invalid prefix tensor: {name}")
+        if list(tensor.shape) != expected_shapes[name] or not torch.isfinite(tensor).all():
+            raise ValueError(f"Invalid prefix tensor: {name} {list(tensor.shape)} != {expected_shapes[name]}")
         if tensor.dtype != torch.float32:
             raise ValueError(f"Expected FP32 trained prefix tensor: {name}")
     index = json.loads((base_model / "model.safetensors.index.json").read_text())
@@ -68,6 +87,17 @@ def export(checkpoint, base_model, output, max_length=65536):
     config.update(architectures=[ARCHITECTURE], max_position_embeddings=max_length,
                   residual_attention_prefix_num_virtual_tokens=count,
                   residual_attention_prefix_key_init_std=prefix_config.get("key_init_std", 0.02))
+    if mode == "nope_token_joint":
+        config.update(
+            residual_attention_prefix_joint_softmax=True,
+            residual_attention_prefix_mode="nope_token_joint",
+        )
+    elif mode == "nope_token_null_additive":
+        config.update(
+            residual_attention_prefix_joint_softmax=False,
+            residual_attention_prefix_mode="nope_token_null_additive",
+            residual_attention_prefix_branch_sizes=branch_sizes,
+        )
     prefix_file = "residual_attention_prefix.safetensors"
     index["weight_map"].update({name: prefix_file for name in state})
     index.setdefault("metadata", {})["total_size"] = index.get("metadata", {}).get("total_size", 0) + sum(t.numel()*t.element_size() for t in state.values())

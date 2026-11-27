@@ -189,16 +189,17 @@ class JointPrefixFlashAttention(FlashAttentionImpl):
         )
         # Flattening queries is valid here because every request reads the same
         # immutable prefix and noncausal attention treats query rows independently.
+        pref_query = prefix._pre_rope_query[:count] if mode == "nope_token_joint" else live_query
         pref, pref_lse = flash_attn_varlen_func(
-            q=live_query, k=prefix._cached_prefix_key, v=prefix._cached_prefix_value,
+            q=pref_query, k=prefix._cached_prefix_key, v=prefix._cached_prefix_value,
             cu_seqlens_q=prefix._joint_offsets * count, max_seqlen_q=count,
             cu_seqlens_k=prefix._joint_key_offsets, max_seqlen_k=prefix.num_prefix_tokens,
             softmax_scale=self.scale, causal=False, fa_version=self.vllm_flash_attn_version,
             return_softmax_lse=True,
         )
         pref_lse = (pref_lse + prefix.prefix_logit_bias.float()[:, None]).contiguous()
-        if mode == "token_null_additive":
-            pref_lse = pref_lse - prefix._null_projection[:count].transpose(0, 1)
+        if mode in ("token_null_additive", "nope_token_joint"):
+            pref_lse = (pref_lse - prefix._null_projection[:count].transpose(0, 1)).contiguous()
         if anchored:
             weight = pref_lse.sigmoid().transpose(0, 1).unsqueeze(-1)
             output[:count].copy_((ctx_result.float() + weight * pref.float()).to(output.dtype))

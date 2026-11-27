@@ -15,7 +15,13 @@ class ResidualPrefixAttentionMixin:
 
         prefix_key = self.k_norm(
             prefix_key.view(-1, self.num_kv_heads, self.head_dim)
-        ).view(-1, self.kv_size)
+        )
+        if getattr(self, "prefix_mode", "joint") == "nope_token_joint":
+            return (
+                prefix_key.contiguous(),
+                prefix_value.view(-1, self.num_kv_heads, self.head_dim).contiguous(),
+            )
+        prefix_key = prefix_key.view(-1, self.kv_size)
         prefix_positions = torch.arange(
             -self.num_prefix_tokens,
             0,
